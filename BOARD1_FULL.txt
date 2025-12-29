@@ -1,0 +1,774 @@
+        LIST    P=16F877A
+        INCLUDE "p16f877a.inc"
+        __CONFIG h'3F31'
+
+;=================================================
+; CONSTANTS
+;=================================================
+DESIRED_FRAC     EQU d'5'          ; hedef .5
+
+; UART @4MHz, 9600 baud, BRGH=1 -> SPBRG=25 (≈9615 bps)
+UART_SPBRG_9600  EQU d'25'
+
+;=================================================
+; VARIABLES (BANK0 RAM)
+;=================================================
+        CBLOCK  0x20
+; ---- HVAC / Display ----
+            tempC
+            temp_frac
+            TENS
+            ONES
+            DLY
+            cntA
+            cntB
+            display_mode      ; 0=A, 1=D, 2=F
+            fan_cnt
+            fan_int
+            fan_frac
+
+; ---- Setpoint (değişebilir) ----
+            desired_int
+
+; ---- Keypad ----
+            row_idx
+            col_idx
+            key_idx
+            last_key
+            prev_key
+            kp_delay
+            digit_state
+            input_enable
+
+; ---- UART RX Parser ----
+            uart_rx
+            uart_state        ; 0=ilk digit bekle, 1=ikinci digit bekle
+            uart_tens         ; ilk digit*10 tutulur
+
+; ---- ISR save ----
+            w_temp
+            status_temp
+            pclath_temp
+        ENDC
+
+;=================================================
+; RESET / INTERRUPT VECTORS
+;=================================================
+        ORG     0x0000
+        GOTO    INIT
+
+        ORG     0x0004
+        GOTO    ISR
+
+;=================================================
+; INIT
+;=================================================
+INIT:
+        ; ---- başlangıç setpoint ----
+        BANKSEL desired_int
+        MOVLW   d'27'
+        MOVWF   desired_int
+
+        ; ---- Display: PORTD segments, RC0..RC3 digit select ----
+        BANKSEL TRISD
+        CLRF    TRISD
+        BANKSEL PORTD
+        CLRF    PORTD
+
+        ; TRISC:
+        ; RC0-3 output (digit select)
+        ; RC4-5 input  (keypad col)
+        ; RC6 output   (TX)
+        ; RC7 input    (RX)
+        BANKSEL TRISC
+        MOVLW   b'10110000'
+        MOVWF   TRISC
+
+        BANKSEL PORTC
+        CLRF    PORTC
+
+        ; ---- HVAC + Keypad: PORTB ----
+        ; RB0 heater out, RB1 fan out
+        ; RB2-5 keypad row out
+        ; RB6-7 keypad col in
+        BANKSEL TRISB
+        MOVLW   b'11000000'
+        MOVWF   TRISB
+
+        BANKSEL PORTB
+        CLRF    PORTB
+        BSF     PORTB,2
+        BSF     PORTB,3
+        BSF     PORTB,4
+        BSF     PORTB,5
+
+        ; ---- Keypad init ----
+        BANKSEL input_enable
+        CLRF    input_enable
+        CLRF    digit_state
+        CLRF    last_key
+        MOVLW   0xFF
+        MOVWF   prev_key
+
+        ; ---- PORTA: RA0 AN0 input, RA4 T0CKI input ----
+        BANKSEL TRISA
+        MOVLW   b'00010001'
+        MOVWF   TRISA
+
+        ; ---- ADC ----
+        BANKSEL ADCON1
+        MOVLW   b'00001110'      ; AN0 analog, others digital
+        MOVWF   ADCON1
+
+        BANKSEL ADCON0
+        MOVLW   b'01000001'      ; ADC ON, CH0
+        MOVWF   ADCON0
+
+        ; ---- TIMER0 fan tach ----
+        BANKSEL OPTION_REG
+        BSF     OPTION_REG, T0CS
+        BCF     OPTION_REG, T0SE
+        BCF     OPTION_REG, PSA
+        MOVLW   b'00000111'      ; 1:256
+        IORWF   OPTION_REG,F
+
+        BANKSEL TMR0
+        CLRF    TMR0
+
+        ; ---- UART init (async, 9600, RX interrupt) ----
+        BANKSEL SPBRG
+        MOVLW   UART_SPBRG_9600
+        MOVWF   SPBRG
+
+        BANKSEL TXSTA
+        MOVLW   b'00100100'      ; BRGH=1, TXEN=1, async
+        MOVWF   TXSTA
+
+        BANKSEL RCSTA
+        MOVLW   b'10010000'      ; SPEN=1, CREN=1
+        MOVWF   RCSTA
+
+        BANKSEL PIR1
+        BCF     PIR1, RCIF
+
+        BANKSEL PIE1
+        BSF     PIE1, RCIE        ; RX interrupt enable
+
+        BANKSEL INTCON
+        BSF     INTCON, PEIE
+        BSF     INTCON, GIE
+
+        ; ---- UART parser init ----
+        BANKSEL uart_state
+        CLRF    uart_state
+        CLRF    uart_tens
+
+        ; ---- display mode ----
+        BANKSEL display_mode
+        CLRF    display_mode
+
+        GOTO    MAIN_LOOP
+
+;=================================================
+; INTERRUPT SERVICE ROUTINE (UART RX)
+;=================================================
+ISR:
+        ; context save
+        MOVWF   w_temp
+        SWAPF   STATUS,W
+        MOVWF   status_temp
+        MOVF    PCLATH,W
+        MOVWF   pclath_temp
+        CLRF    PCLATH
+
+        ; UART RX?
+        BANKSEL PIR1
+        BTFSS   PIR1, RCIF
+        GOTO    ISR_EXIT
+
+        ; overrun error fix
+        BANKSEL RCSTA
+        BTFSS   RCSTA, OERR
+        GOTO    RX_READ
+        BCF     RCSTA, CREN
+        BSF     RCSTA, CREN
+
+RX_READ:
+        BANKSEL RCREG
+        MOVF    RCREG,W
+        BANKSEL uart_rx
+        MOVWF   uart_rx
+
+        ; ASCII '0'..'9' ?
+        MOVF    uart_rx,W
+        SUBLW   '9'
+        BTFSS   STATUS,C
+        GOTO    ISR_EXIT
+        MOVF    uart_rx,W
+        SUBLW   '0'
+        BTFSC   STATUS,C
+        GOTO    RX_IS_DIGIT
+        GOTO    ISR_EXIT
+
+RX_IS_DIGIT:
+        ; W = uart_rx
+        MOVF    uart_rx,W
+        ADDLW   -'0'             ; convert to 0..9
+
+        ; state?
+        BANKSEL uart_state
+        MOVF    uart_state,W
+        BTFSC   STATUS,Z
+        GOTO    RX_FIRST
+
+; ---- second digit ----
+RX_SECOND:
+        ; desired_int = uart_tens + digit
+        BANKSEL uart_tens
+        MOVF    uart_tens,W
+        BANKSEL desired_int
+        MOVWF   desired_int      ; start with tens*10 already
+        BANKSEL uart_rx
+        MOVF    uart_rx,W
+        ADDLW   -'0'
+        BANKSEL desired_int
+        ADDWF   desired_int,F
+
+        ; reset parser
+        BANKSEL uart_state
+        CLRF    uart_state
+        BANKSEL uart_tens
+        CLRF    uart_tens
+        GOTO    ISR_EXIT
+
+; ---- first digit ----
+RX_FIRST:
+        ; uart_tens = digit * 10 (x10 = x2 + x8)
+        ; W currently = digit(0..9)? No, we recompute safe:
+        BANKSEL uart_rx
+        MOVF    uart_rx,W
+        ADDLW   -'0'             ; digit in W
+
+        ; make x2 in uart_tens
+        BANKSEL uart_tens
+        MOVWF   uart_tens
+        BCF     STATUS,C
+        RLF     uart_tens,F      ; x2
+
+        ; make x8 in uart_state (temp use)
+        BANKSEL uart_state
+        MOVWF   uart_state
+        BCF     STATUS,C
+        RLF     uart_state,F     ; x2
+        BCF     STATUS,C
+        RLF     uart_state,F     ; x4
+        BCF     STATUS,C
+        RLF     uart_state,F     ; x8
+
+        ; uart_tens = x2 + x8 = x10
+        MOVF    uart_state,W
+        BANKSEL uart_tens
+        ADDWF   uart_tens,F
+
+        ; set state=1 (waiting second digit)
+        BANKSEL uart_state
+        MOVLW   1
+        MOVWF   uart_state
+
+ISR_EXIT:
+        ; context restore
+        MOVF    pclath_temp,W
+        MOVWF   PCLATH
+        SWAPF   status_temp,W
+        MOVWF   STATUS
+        SWAPF   w_temp,F
+        SWAPF   w_temp,W
+        RETFIE
+
+;=================================================
+; MAIN LOOP
+;=================================================
+MAIN_LOOP:
+        ; keypad task (non-blocking)
+        CALL    KEYPAD_TASK
+
+        CALL    READ_TEMP
+        CALL    HVAC_CONTROL
+        CALL    READ_FAN
+
+        MOVF    display_mode,W
+        BTFSC   STATUS,Z
+        GOTO    SHOW_AMBIENT
+
+        MOVF    display_mode,W
+        XORLW   1
+        BTFSC   STATUS,Z
+        GOTO    SHOW_DESIRED
+
+        GOTO    SHOW_FAN
+
+SHOW_AMBIENT:
+        GOTO    DO_DISPLAY
+
+SHOW_DESIRED:
+        ; show desired_int.5
+        BANKSEL desired_int
+        MOVF    desired_int,W
+        BANKSEL tempC
+        MOVWF   tempC
+        MOVLW   DESIRED_FRAC
+        MOVWF   temp_frac
+        GOTO    DO_DISPLAY
+
+SHOW_FAN:
+        MOVF    fan_int,W
+        MOVWF   tempC
+        MOVF    fan_frac,W
+        MOVWF   temp_frac
+
+DO_DISPLAY:
+        CALL    SPLIT_2DIG
+        CALL    WAIT_2S_DISPLAY
+
+        INCF    display_mode,F
+        MOVLW   d'3'
+        SUBWF   display_mode,W
+        BTFSC   STATUS,C
+        CLRF    display_mode
+
+        GOTO    MAIN_LOOP
+
+;=================================================
+; KEYPAD TASK (A + two digits, # commit)
+;=================================================
+; KEY MAP from your table:
+; 0..9 => digits, A=0x0A, #=0x0F
+KEYPAD_TASK:
+        CALL    KEYPAD_GET          ; W=key or 0xFF
+        MOVWF   key_idx
+
+        ; no key
+        MOVF    key_idx,W
+        XORLW   0xFF
+        BTFSC   STATUS,Z
+        RETURN
+
+        ; same key debounce
+        MOVF    prev_key,W
+        SUBWF   key_idx,W
+        BTFSC   STATUS,Z
+        RETURN
+
+        ; new key -> save prev at end
+        ; A pressed?
+        MOVF    key_idx,W
+        XORLW   0x0A
+        BTFSS   STATUS,Z
+        GOTO    KP_CHECK_ENABLE
+
+        MOVLW   1
+        MOVWF   input_enable
+        CLRF    digit_state
+        CLRF    last_key
+        GOTO    KP_SAVE_PREV
+
+KP_CHECK_ENABLE:
+        MOVF    input_enable,W
+        BTFSC   STATUS,Z
+        GOTO    KP_SAVE_PREV
+
+        ; # pressed? commit
+        MOVF    key_idx,W
+        XORLW   0x0F
+        BTFSS   STATUS,Z
+        GOTO    KP_DIGIT
+
+        CLRF    input_enable
+        CLRF    digit_state
+        ; commit last_key -> desired_int
+        MOVF    last_key,W
+        MOVWF   desired_int
+        GOTO    KP_SAVE_PREV
+
+KP_DIGIT:
+        ; only accept 0..9 (key table returns digit values)
+        MOVF    key_idx,W
+        SUBLW   d'9'
+        BTFSS   STATUS,C
+        GOTO    KP_SAVE_PREV
+
+        MOVF    digit_state,W
+        BTFSS   STATUS,Z
+        GOTO    KP_SECOND
+
+        ; first digit: last_key = digit*10
+        MOVF    key_idx,W
+        MOVWF   last_key
+        BCF     STATUS,C
+        RLF     last_key,F         ; x2
+
+        MOVWF   kp_delay
+        BCF     STATUS,C
+        RLF     kp_delay,F         ; x2
+        BCF     STATUS,C
+        RLF     kp_delay,F         ; x4
+        BCF     STATUS,C
+        RLF     kp_delay,F         ; x8
+
+        MOVF    kp_delay,W
+        ADDWF   last_key,F         ; x10
+
+        MOVLW   1
+        MOVWF   digit_state
+        GOTO    KP_SAVE_PREV
+
+KP_SECOND:
+        MOVF    key_idx,W
+        ADDWF   last_key,F
+        CLRF    digit_state
+        CLRF    input_enable
+        ; auto-commit after 2 digits
+        MOVF    last_key,W
+        MOVWF   desired_int
+
+KP_SAVE_PREV:
+        MOVF    key_idx,W
+        MOVWF   prev_key
+        RETURN
+
+;=================================================
+; KEYPAD GET (returns W=key or 0xFF)
+;=================================================
+KEYPAD_GET:
+        MOVLW   0xFF
+        MOVWF   key_idx
+        CLRF    row_idx
+
+KP_SCAN_ROW:
+        ; all rows high
+        BSF     PORTB,2
+        BSF     PORTB,3
+        BSF     PORTB,4
+        BSF     PORTB,5
+
+        MOVF    row_idx,W
+        CALL    DRIVE_ROW_LOW
+        CALL    KP_SMALL_DELAY
+
+        CALL    READ_COL
+        BTFSS   STATUS,Z
+        GOTO    KP_FOUND
+
+        INCF    row_idx,F
+        MOVLW   d'4'
+        SUBWF   row_idx,W
+        BTFSS   STATUS,Z
+        GOTO    KP_SCAN_ROW
+
+        MOVLW   0xFF
+        RETURN
+
+KP_FOUND:
+        MOVF    row_idx,W
+        MOVWF   key_idx
+        RLF     key_idx,F
+        RLF     key_idx,F
+        MOVF    col_idx,W
+        ADDWF   key_idx,F
+        MOVF    key_idx,W
+        CALL    KEY_TABLE
+        RETURN
+
+DRIVE_ROW_LOW:
+        ADDWF   PCL,F
+        GOTO    KP_ROW0
+        GOTO    KP_ROW1
+        GOTO    KP_ROW2
+        GOTO    KP_ROW3
+KP_ROW0: BCF PORTB,2
+        RETURN
+KP_ROW1: BCF PORTB,3
+        RETURN
+KP_ROW2: BCF PORTB,4
+        RETURN
+KP_ROW3: BCF PORTB,5
+        RETURN
+
+READ_COL:
+        ; cols: RB6,RB7,RC4,RC5
+        BTFSS   PORTB,6
+        GOTO    KP_C0
+        BTFSS   PORTB,7
+        GOTO    KP_C1
+        BTFSS   PORTC,4
+        GOTO    KP_C2
+        BTFSS   PORTC,5
+        GOTO    KP_C3
+        BSF     STATUS,Z
+        RETURN
+KP_C0:   MOVLW   0
+        MOVWF   col_idx
+        BCF     STATUS,Z
+        RETURN
+KP_C1:   MOVLW   1
+        MOVWF   col_idx
+        BCF     STATUS,Z
+        RETURN
+KP_C2:   MOVLW   2
+        MOVWF   col_idx
+        BCF     STATUS,Z
+        RETURN
+KP_C3:   MOVLW   3
+        MOVWF   col_idx
+        BCF     STATUS,Z
+        RETURN
+
+KEY_TABLE:
+        ADDWF   PCL,F
+        RETLW   0x01
+        RETLW   0x02
+        RETLW   0x03
+        RETLW   0x0A    ; A
+        RETLW   0x04
+        RETLW   0x05
+        RETLW   0x06
+        RETLW   0x0B
+        RETLW   0x07
+        RETLW   0x08
+        RETLW   0x09
+        RETLW   0x0C
+        RETLW   0x0E
+        RETLW   0x00
+        RETLW   0x0F    ; #
+        RETLW   0x0D
+
+KP_SMALL_DELAY:
+        MOVLW   d'60'
+        MOVWF   kp_delay
+KP_SD:
+        DECFSZ  kp_delay,F
+        GOTO    KP_SD
+        RETURN
+
+;=================================================
+; READ FAN
+;=================================================
+READ_FAN:
+        CLRF    TMR0
+        CALL    WAIT_1S
+        MOVF    TMR0,W
+        MOVWF   fan_cnt
+
+        MOVF    fan_cnt,W
+        BTFSS   STATUS,Z
+        GOTO    FAN_VALID
+
+        BTFSS   PORTB,1
+        GOTO    FAN_OFF
+
+        MOVLW   d'20'
+        MOVWF   fan_int
+        CLRF    fan_frac
+        RETURN
+
+FAN_OFF:
+        CLRF    fan_int
+        CLRF    fan_frac
+        RETURN
+
+FAN_VALID:
+        MOVF    fan_cnt,W
+        MOVWF   fan_int
+        CLRF    fan_frac
+        RETURN
+
+WAIT_1S:
+        MOVLW   d'125'
+        MOVWF   cntA
+W1:
+        MOVLW   d'200'
+        MOVWF   cntB
+W2:
+        NOP
+        DECFSZ  cntB,F
+        GOTO    W2
+        DECFSZ  cntA,F
+        GOTO    W1
+        RETURN
+
+;=================================================
+; READ TEMP (AN0)
+;=================================================
+READ_TEMP:
+        MOVLW   d'30'
+        MOVWF   DLY
+ACQ:
+        DECFSZ  DLY,F
+        GOTO    ACQ
+
+        BSF     ADCON0, GO
+WAIT_ADC:
+        BTFSC   ADCON0, GO
+        GOTO    WAIT_ADC
+
+        MOVF    ADRESH,W
+        MOVWF   tempC
+
+        BCF     STATUS,C
+        RLF     tempC,F
+
+        BTFSS   ADRESH,0
+        GOTO    FRAC_ZERO
+        MOVLW   d'5'
+        MOVWF   temp_frac
+        RETURN
+FRAC_ZERO:
+        CLRF    temp_frac
+        RETURN
+
+;=================================================
+; HVAC CONTROL (compare tempC vs desired_int)
+;=================================================
+HVAC_CONTROL:
+        BCF     PORTB,0
+        BCF     PORTB,1
+
+        MOVF    tempC,W
+        SUBLW   desired_int
+
+        BTFSS   STATUS,C
+        GOTO    COOLER_ON
+
+        BTFSC   STATUS,Z
+        RETURN
+
+HEATER_ON:
+        BSF     PORTB,0
+        RETURN
+
+COOLER_ON:
+        BSF     PORTB,1
+        RETURN
+
+;=================================================
+; SPLIT 2 DIGITS
+;=================================================
+SPLIT_2DIG:
+        MOVF    tempC,W
+        MOVWF   ONES
+        CLRF    TENS
+DIV10:
+        MOVLW   d'10'
+        SUBWF   ONES,F
+        BTFSS   STATUS,C
+        GOTO    DIV_END
+        INCF    TENS,F
+        GOTO    DIV10
+DIV_END:
+        MOVLW   d'10'
+        ADDWF   ONES,F
+        RETURN
+
+;=================================================
+; DISPLAY (PORTD seg, RC0-3 digit)
+;=================================================
+MUX_ONCE:
+        CLRF    PORTC
+
+        ; D1: A/D/F
+        MOVF    display_mode,W
+        XORLW   0
+        BTFSC   STATUS,Z
+        GOTO    DISP_A
+
+        MOVF    display_mode,W
+        XORLW   1
+        BTFSC   STATUS,Z
+        GOTO    DISP_D
+
+        GOTO    DISP_F
+
+DISP_A:
+        MOVLW   d'10'
+        GOTO    SET_CHAR
+DISP_D:
+        MOVLW   d'13'
+        GOTO    SET_CHAR
+DISP_F:
+        MOVLW   d'14'
+
+SET_CHAR:
+        CALL    DIGIT_TABLE
+        MOVWF   PORTD
+        BSF     PORTC,0
+        CALL    SMALL_DELAY
+        BCF     PORTC,0
+
+        ; D2: tens
+        MOVF    TENS,W
+        CALL    DIGIT_TABLE
+        MOVWF   PORTD
+        BSF     PORTC,1
+        CALL    SMALL_DELAY
+        BCF     PORTC,1
+
+        ; D3: ones + dot
+        MOVF    ONES,W
+        CALL    DIGIT_TABLE
+        IORLW   b'10000000'
+        MOVWF   PORTD
+        BSF     PORTC,2
+        CALL    SMALL_DELAY
+        BCF     PORTC,2
+
+        ; D4: frac
+        MOVF    temp_frac,W
+        CALL    DIGIT_TABLE
+        MOVWF   PORTD
+        BSF     PORTC,3
+        CALL    SMALL_DELAY
+        BCF     PORTC,3
+        RETURN
+
+WAIT_2S_DISPLAY:
+        MOVLW   d'32'
+        MOVWF   cntA
+L1:
+        MOVLW   d'50'
+        MOVWF   cntB
+L2:
+        CALL    MUX_ONCE
+        CALL    SMALL_DELAY
+        DECFSZ  cntB,F
+        GOTO    L2
+        DECFSZ  cntA,F
+        GOTO    L1
+        RETURN
+
+SMALL_DELAY:
+        MOVLW   d'60'
+        MOVWF   DLY
+DL:
+        DECFSZ  DLY,F
+        GOTO    DL
+        RETURN
+
+DIGIT_TABLE:
+        ADDWF   PCL,F
+        RETLW   b'00111111' ;0
+        RETLW   b'00000110' ;1
+        RETLW   b'01011011' ;2
+        RETLW   b'01001111' ;3
+        RETLW   b'01100110' ;4
+        RETLW   b'01101101' ;5
+        RETLW   b'01111101' ;6
+        RETLW   b'00000111' ;7
+        RETLW   b'01111111' ;8
+        RETLW   b'01101111' ;9
+        RETLW   b'01110111' ;10 = A
+        RETLW   b'00000000'
+        RETLW   b'00000000'
+        RETLW   b'01011110' ;13 = D
+        RETLW   b'01110001' ;14 = F
+
+        END

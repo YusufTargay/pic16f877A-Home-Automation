@@ -1,0 +1,407 @@
+;====================================================================
+; PROJECT: HVAC Control System with 7-Segment Display
+; CONTROLLER: PIC16F877A
+; FREQUENCY: 4MHz (Assumed based on typical config)
+;
+; DESCRIPTION:
+; This program controls a Heater and a Cooler based on temperature.
+; It reads temperature from AN0 and Fan speed from RA4 (T0CKI).
+; It displays 3 modes on a 4-digit 7-Segment Display:
+;   1. Ambient Temperature (A)
+;   2. Desired Temperature (D)
+;   3. Fan Speed (F)
+;====================================================================
+
+LIST    P=16F877A
+        INCLUDE "p16f877a.inc"
+        __CONFIG h'3F31'  ; Configuration Word (HS Osc, WDT Off, PWRT On, etc.)
+
+;================ CONSTANTS =================
+DESIRED_INT  EQU d'27'    
+DESIRED_FRAC EQU d'5'    
+
+;================ VARIABLES =================
+        CBLOCK  0x20
+            tempC         ; Integer part of temperature
+            temp_frac     ; Fractional part of temperature (0 or 5)
+            TENS          ; Tens digit for display
+            ONES          ; Ones digit for display
+            DLY           ; General delay counter
+            cntA          ; Delay loop counter A
+            cntB          ; Delay loop counter B
+
+            display_mode  ; State Machine: 0=Ambient, 1=Desired, 2=Fan
+
+            fan_cnt       ; Raw Timer0 count
+            fan_int       ; Processed Fan Integer (RPS)
+            fan_frac      ; Fan Fractional part
+        ENDC
+
+;================ RESET VECTOR ==============
+        ORG     0x0000
+        GOTO    INIT     
+
+;================ INIT ======================
+INIT:
+        ; -------- DISPLAY PORTS SETUP --------
+        BANKSEL TRISD
+        CLRF    TRISD       ; PORTD is Output (Segments a-g, dp)
+        BANKSEL TRISC
+        CLRF    TRISC       ; PORTC is Output (Digit Multiplexing Control)
+
+        BANKSEL PORTD
+        CLRF    PORTD       ; Clear outputs
+        BANKSEL PORTC
+        CLRF    PORTC
+
+        ; -------- HVAC CONTROL PINS --------
+        ; RB0 = Heater Relay
+        ; RB1 = Cooler/Fan Relay
+        BANKSEL TRISB
+        BCF     TRISB,0     ; RB0 as Output
+        BCF     TRISB,1     ; RB1 as Output
+        BANKSEL PORTB
+        CLRF    PORTB       ; Turn off HVAC initially
+
+        ; -------- INPUT PINS SETUP --------
+        ; RA0 = AN0 (Temperature Sensor Analog Input)
+        ; RA4 = T0CKI (Fan Tachometer Digital Input)
+        BANKSEL TRISA
+        MOVLW   b'00010001' ; Set RA0 and RA4 as Inputs
+        MOVWF   TRISA
+
+        ; -------- ADC MODULE SETUP --------
+        BANKSEL ADCON1
+        ; ADCON1: Left Justified, AN0 Analog, others Digital
+        MOVLW   b'00001110' 
+        MOVWF   ADCON1
+
+        BANKSEL ADCON0
+        ; ADCON0: Fosc/8, Channel 0 (AN0), ADC On
+        MOVLW   b'01000001' 
+        MOVWF   ADCON0
+
+        ; -------- TIMER0 SETUP (FAN SPEED) --------
+        BANKSEL OPTION_REG
+        BSF     OPTION_REG, T0CS     ; Select External Clock (RA4 pin)
+        BCF     OPTION_REG, T0SE     ; Count on Rising Edge
+        BCF     OPTION_REG, PSA      ; Prescaler assigned to Timer0
+        MOVLW   b'00000111'          ; Set Prescaler to 1:256
+        IORWF   OPTION_REG,F
+
+        BANKSEL TMR0
+        CLRF    TMR0                 ; Clear Timer0 counter
+
+        CLRF    display_mode         ; Initialize display mode to 'Ambient'
+
+        GOTO    MAIN_LOOP
+
+;================ MAIN LOOP =================
+
+MAIN_LOOP:
+        CALL    READ_TEMP       ; Read Temperature from ADC
+        CALL    HVAC_CONTROL    ; Update Heater/Cooler state
+        CALL    READ_FAN        ; Measure Fan RPM
+
+        ; Check display_mode to decide what to show
+        ; 0 -> Show Ambient Temp
+        ; 1 -> Show Desired Temp
+        ; 2 -> Show Fan Speed
+        MOVF    display_mode,W
+        BTFSC   STATUS,Z
+        GOTO    SHOW_AMBIENT
+
+        MOVF    display_mode,W
+        XORLW   1
+        BTFSC   STATUS,Z
+        GOTO    SHOW_DESIRED
+
+        GOTO    SHOW_FAN        ; Else, show Fan
+
+SHOW_AMBIENT:
+        GOTO    DO_DISPLAY      ; tempC is already current temp
+
+SHOW_DESIRED:
+        ; Load Target Temp values for display
+        MOVLW   DESIRED_INT
+        MOVWF   tempC
+        MOVLW   DESIRED_FRAC
+        MOVWF   temp_frac
+        GOTO    DO_DISPLAY
+
+SHOW_FAN:
+        ; Load Fan Speed values for display
+        MOVF    fan_int,W
+        MOVWF   tempC
+        MOVF    fan_frac,W
+        MOVWF   temp_frac
+
+DO_DISPLAY:
+        CALL    SPLIT_2DIG      ; Separate Value into TENS and ONES
+        CALL    WAIT_2S_DISPLAY ; Refresh display for ~2 seconds
+
+        ; Cycle to next display mode (0 -> 1 -> 2 -> 0)
+        INCF    display_mode,F
+        MOVLW   d'3'
+        SUBWF   display_mode,W
+        BTFSC   STATUS,C        ; If mode >= 3
+        CLRF    display_mode    ; Reset to 0
+
+        GOTO    MAIN_LOOP
+
+;================ SUBROUTINE: READ FAN ======
+; Measures fan speed by counting pulses on RA4 for 1 second.
+;====================================================================
+READ_FAN:
+        BANKSEL TMR0
+        CLRF    TMR0            ; Reset counter
+
+        CALL    WAIT_1S         ; Wait for 1 second accumulation
+
+        MOVF    TMR0,W          ; Read counted pulses
+        MOVWF   fan_cnt
+
+        MOVF    fan_cnt,W
+        BTFSS   STATUS,Z        
+        GOTO    FAN_VALID      
+
+        BANKSEL PORTB
+        BTFSS   PORTB,1         
+        GOTO    FAN_OFF         
+	
+        MOVLW   d'60'
+        MOVWF   fan_int
+        CLRF    fan_frac
+        RETURN
+
+FAN_OFF:
+        CLRF    fan_int
+        CLRF    fan_frac
+        RETURN
+
+FAN_VALID:
+        MOVF    fan_cnt,W
+        MOVWF   fan_int         
+        CLRF    fan_frac       
+        RETURN
+
+; Simple nested loop for approx. 1 Second Delay
+WAIT_1S:
+        MOVLW   d'125'
+        MOVWF   cntA
+W1:
+        MOVLW   d'200'
+        MOVWF   cntB
+W2:
+        NOP
+        DECFSZ  cntB,F
+        GOTO    W2
+        DECFSZ  cntA,F
+        GOTO    W1
+        RETURN
+
+;================ SUBROUTINE: READ TEMP =====
+; Reads ADC value from AN0 and converts to approximated format.
+;====================================================================
+READ_TEMP:
+        ; Acquisition Delay (charging internal capacitor)
+        MOVLW   d'30'
+        MOVWF   DLY
+ACQ:
+        DECFSZ  DLY,F
+        GOTO    ACQ
+
+        BSF     ADCON0, GO      ; Start Conversion
+WAIT_ADC:
+        BTFSC   ADCON0, GO      ; Wait until DONE
+        GOTO    WAIT_ADC
+
+        BANKSEL ADRESH
+        MOVF    ADRESH,W        ; Read High Byte (Left Justified)
+        MOVWF   tempC
+
+        ; Process raw value (Shift Left)
+        BCF     STATUS,C
+        RLF     tempC,F
+
+        ; Check Bit 0 for fractional part logic
+        BTFSS   ADRESH,0
+        GOTO    FRAC_ZERO
+        MOVLW   d'5'            ; If bit0 is 1, set fraction to .5
+        MOVWF   temp_frac
+        RETURN
+FRAC_ZERO:
+        CLRF    temp_frac       ; Else, fraction is .0
+        RETURN
+
+;================ SUBROUTINE: HVAC CONTROL ==
+; Simple On/Off (Bang-Bang) Controller
+;====================================================================
+HVAC_CONTROL:
+        BANKSEL PORTB
+        BCF     PORTB,0         ; Reset Heater
+        BCF     PORTB,1         ; Reset Cooler
+
+        MOVF    tempC,W
+        SUBLW   DESIRED_INT     ; W = Desired - Actual
+
+        ; If Result is Negative (C=0), Actual > Desired -> Too Hot
+        BTFSS   STATUS,C
+        GOTO    COOLER_ON
+
+        ; If Result is Zero, Temperature is perfect -> All Off
+        BTFSC   STATUS,Z
+        RETURN
+
+        ; Else (C=1, Z=0), Actual < Desired -> Too Cold
+HEATER_ON:
+        BSF     PORTB,0         ; Turn ON Heater
+        RETURN
+
+COOLER_ON:
+        BSF     PORTB,1         ; Turn ON Cooler
+        RETURN
+
+;================ SUBROUTINE: SPLIT DIGITS ==
+; Converts binary number in 'tempC' to Decimal 'TENS' and 'ONES'
+; (Repeated Subtraction Method)
+;====================================================================
+SPLIT_2DIG:
+        MOVF    tempC,W
+        MOVWF   ONES
+        CLRF    TENS
+DIV10:
+        MOVLW   d'10'
+        SUBWF   ONES,F          ; ONES = ONES - 10
+        BTFSS   STATUS,C        ; Did underflow occur?
+        GOTO    DIV_END         ; Yes, restore and exit
+        INCF    TENS,F          ; No, increment Tens count
+        GOTO    DIV10
+DIV_END:
+        MOVLW   d'10'
+        ADDWF   ONES,F          ; Restore the last subtraction
+        RETURN
+
+;================ SUBROUTINE: DISPLAY MUX ===
+; Multiplexes the 4 digits rapidly to create a steady image.
+; D1: Mode Char, D2: Tens, D3: Ones(+dot), D4: Fraction
+;====================================================================
+MUX_ONCE:
+        BANKSEL PORTC
+        CLRF    PORTC           ; Turn off all digits
+
+        ; ---- Select Character for Digit 1 (A, D, or F) ----
+        MOVF    display_mode,W
+        XORLW   0
+        BTFSC   STATUS,Z
+        GOTO    DISP_A          ; Mode 0 = A
+
+        MOVF    display_mode,W
+        XORLW   1
+        BTFSC   STATUS,Z
+        GOTO    DISP_D          ; Mode 1 = D
+
+        GOTO    DISP_F          ; Mode 2 = F
+
+DISP_A:
+        MOVLW   d'10'           ; Index for 'A'
+        GOTO    SET_CHAR
+
+DISP_D:
+        MOVLW   d'13'           ; Index for 'D'
+        GOTO    SET_CHAR
+
+DISP_F:
+        MOVLW   d'14'           ; Index for 'F'
+
+SET_CHAR:
+        ; ---- Drive Digit 1 ----
+        CALL    DIGIT_TABLE     ; Get 7-seg pattern
+        BANKSEL PORTD
+        MOVWF   PORTD           ; Send to segments
+        BANKSEL PORTC
+        BSF     PORTC,0         ; Enable Digit 1
+        CALL    SMALL_DELAY     ; Persistence delay
+        BCF     PORTC,0         ; Disable Digit 1
+
+        ; ---- Drive Digit 2 (Tens) ----
+        MOVF    TENS,W
+        CALL    DIGIT_TABLE
+        BANKSEL PORTD
+        MOVWF   PORTD
+        BANKSEL PORTC
+        BSF     PORTC,1
+        CALL    SMALL_DELAY
+        BCF     PORTC,1
+
+        ; ---- Drive Digit 3 (Ones + Decimal Point) ----
+        MOVF    ONES,W
+        CALL    DIGIT_TABLE
+        IORLW   b'10000000'     ; Add Decimal Point (Bit 7)
+        BANKSEL PORTD
+        MOVWF   PORTD
+        BANKSEL PORTC
+        BSF     PORTC,2
+        CALL    SMALL_DELAY
+        BCF     PORTC,2
+
+        ; ---- Drive Digit 4 (Fraction) ----
+        MOVF    temp_frac,W
+        CALL    DIGIT_TABLE
+        BANKSEL PORTD
+        MOVWF   PORTD
+        BANKSEL PORTC
+        BSF     PORTC,3
+        CALL    SMALL_DELAY
+        BCF     PORTC,3
+
+        RETURN
+
+; Loop to refresh display for approx. 2 seconds
+WAIT_2S_DISPLAY:
+        MOVLW   d'32'
+        MOVWF   cntA
+L1:
+        MOVLW   d'50'
+        MOVWF   cntB
+L2:
+        CALL    MUX_ONCE        ; Refresh all 4 digits once
+        CALL    SMALL_DELAY
+        DECFSZ  cntB,F
+        GOTO    L2
+        DECFSZ  cntA,F
+        GOTO    L1
+        RETURN
+
+; Short delay for persistence of vision
+SMALL_DELAY:
+        MOVLW   d'60'
+        MOVWF   DLY
+DL:
+        DECFSZ  DLY,F
+        GOTO    DL
+        RETURN
+
+;================ LOOKUP TABLE ==============
+; Maps decimal values (0-9, A, D, F) to 7-Segment Patterns
+; (g f e d c b a) -> common cathode assumed based on '1's
+;====================================================================
+DIGIT_TABLE:
+        ADDWF   PCL,F
+        RETLW   b'00111111' ; 0
+        RETLW   b'00000110' ; 1
+        RETLW   b'01011011' ; 2
+        RETLW   b'01001111' ; 3
+        RETLW   b'01100110' ; 4
+        RETLW   b'01101101' ; 5
+        RETLW   b'01111101' ; 6
+        RETLW   b'00000111' ; 7
+        RETLW   b'01111111' ; 8
+        RETLW   b'01101111' ; 9
+        RETLW   b'01110111' ; 10 = 'A' (Ambient)
+        RETLW   b'00000000' ; 11 (Blank)
+        RETLW   b'00000000' ; 12 (Blank)
+        RETLW   b'01011110' ; 13 = 'd' (Desired/Target)
+        RETLW   b'01110001' ; 15 = 'F' (Fan)
+
+        END
