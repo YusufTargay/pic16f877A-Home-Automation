@@ -1,5 +1,5 @@
 ;*******************************************************************************
-; PROJE: AKILLI PERDE S?STEM? - BOARD 1 (FAN HIZI DÜZELT?LD?)
+; PROJE: AKILLI PERDE S?STEM? - BOARD 1 (FAN HIZI DÃœZELT?LD?)
 ; PINOUT: RD0-RD7(Seg), RC0-RC3(Dig), RC4(Heater), RC5(Cooler), RA4(Fan Tach)
 ;*******************************************************************************
     LIST    P=16F877A
@@ -17,7 +17,7 @@
     ORG     0x0000
     GOTO    INIT
 
-;================ BA?LANGIÇ AYARLARI =================
+;================ BA?LANGIÃ‡ AYARLARI =================
 INIT:
     MOVLW   d'35'
     MOVWF   temp_target
@@ -42,8 +42,8 @@ INIT:
     MOVLW   b'00001110'     ; RA0 Analog
     MOVWF   ADCON1
     
-    ; Timer0: RA4 pinindeki yükselen kenarlar? say (T0CS=1, T0SE=0)
-    ; Prescaler'? WDT'ye ata (PSA=1), böylece her darbe direkt say?l?r
+    ; Timer0: RA4 pinindeki yÃ¼kselen kenarlar? say (T0CS=1, T0SE=0)
+    ; Prescaler'? WDT'ye ata (PSA=1), bÃ¶ylece her darbe direkt say?l?r
     BANKSEL OPTION_REG
     MOVLW   b'10101111'     ; T0CS=1, T0SE=0, PSA=1, PORTB Pull-up On
     MOVWF   OPTION_REG
@@ -67,7 +67,7 @@ INIT:
     CLRF    TMR0
     GOTO    MAIN_LOOP
 
-;================ ANA DÖNGÜ =================
+;================ ANA DÃ–NGÃœ =================
 MAIN_LOOP:
     CALL    READ_TEMP       ; Is? oku
     CALL    HVAC_CONTROL    ; Kontrol et
@@ -82,7 +82,7 @@ MAIN_LOOP:
     GOTO    DISPLAY_CONT
     
     CLRF    MODE_TIMER
-    CALL    READ_FAN        ; Sadece mod de?i?irken fan? güncelle (Performans için)
+    CALL    READ_FAN        ; Sadece mod de?i?irken fan? gÃ¼ncelle (Performans iÃ§in)
     INCF    display_mode, F
     MOVLW   d'3'
     SUBWF   display_mode, W
@@ -95,12 +95,12 @@ DISPLAY_CONT:
     CALL    MUX_REFRESH
     GOTO    MAIN_LOOP
 
-;================ FAN OKUMA (TMR0 Üzerinden) =================
+;================ FAN OKUMA (TMR0 Ãœzerinden) =================
 READ_FAN:
     BANKSEL TMR0
     MOVF    TMR0, W         ; Timer0 de?erini oku (RA4'ten gelen sinyal say?s?)
-    MOVWF   fan_int         ; fan_int içine kaydet
-    CLRF    TMR0            ; Bir sonraki say?m için s?f?rla
+    MOVWF   fan_int         ; fan_int iÃ§ine kaydet
+    CLRF    TMR0            ; Bir sonraki say?m iÃ§in s?f?rla
     BANKSEL PORTA
     RETURN
 
@@ -281,7 +281,7 @@ D_E: MOVLW d'10'
     ADDWF ONES, F
     RETURN
 
-S_DLY: MOVLW d'720'
+S_DLY: MOVLW d'255'
     MOVWF DLY
 DS: DECFSZ DLY, F
     GOTO DS
